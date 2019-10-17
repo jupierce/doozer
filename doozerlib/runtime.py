@@ -16,7 +16,6 @@ import functools
 import traceback
 import urlparse
 import signal
-
 import gitdata
 
 import logutil
@@ -32,6 +31,16 @@ from multiprocessing import Lock
 from repos import Repos
 import brew
 from doozerlib.exceptions import DoozerFatalError
+
+
+# Values corresponds to schema for group.yml: builds.permitted. When
+# 'none', doozer itself will inhibit build/rebase related activity
+# (exiting with an error if someone tries). Other values can
+# be interpreted & enforced by the build pipelines (e.g. by
+# invoking config:read-config).
+BUILD_PERMITTED_NONE = 'none'
+BUILD_PERMITTED_MANUAL = 'manual'
+BUILD_PERMITTED_ANY = 'any'
 
 
 # doozer cancel brew builds on SIGINT (Ctrl-C)
@@ -171,6 +180,9 @@ class Runtime(object):
         # Used to capture missing packages for 4.x build
         self.missing_pkgs = set()
 
+        # Which builds will be allowed.
+        self.builds_permitted = BUILD_PERMITTED_ANY
+
     def get_group_config(self):
         # group.yml can contain a `vars` section which should be a
         # single level dict containing keys to str.format(**dict) replace
@@ -287,6 +299,7 @@ class Runtime(object):
             self.group_config = self.get_group_config()
             self.arches = self.group_config.get('arches', ['x86_64'])
             self.repos = Repos(self.group_config.repos, self.arches)
+            self.builds_permitted = self.group_config.builds.permitted or BUILD_PERMITTED_ANY
 
             if validate_content_sets:
                 self.repos.validate_content_sets()
@@ -489,6 +502,15 @@ class Runtime(object):
     @staticmethod
     def timestamp():
         return datetime.datetime.utcnow().isoformat()
+
+    def assert_builds_are_permitted(self):
+        """
+        In group.yml, it is possible to instruct doozer to avoid all builds / mutation of distgits.
+        Call this method if you are about to mutate anything. If builds are disabled, an exception will
+        be thrown.
+        """
+        if self.builds_permitted == BUILD_PERMITTED_NONE:
+            raise DoozerFatalError('Builds for this group are currently disabled (builds.permitted set to {}). Coordinate with the group owner to change this if you believe it is incorrect.'.format(BUILD_PERMITTED_NONE))
 
     def image_metas(self):
         return self.image_map.values()
@@ -921,6 +943,8 @@ class Runtime(object):
             n_threads=n_threads).get()
 
     def push_distgits(self, n_threads=None):
+        self.assert_builds_are_permitted()
+
         if n_threads is None:
             n_threads = self.global_opts['distgit_threads']
         return self._parallel_exec(

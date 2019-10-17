@@ -137,3 +137,10 @@ mapping:
 
   "csv_namespace":
     type: str
+
+  "builds":
+    type: map
+    mapping:
+      "permitted":
+        type: enum
+        enum: [none, manual, any]
