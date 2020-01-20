@@ -344,6 +344,7 @@ def images_update_dockerfile(runtime, stream, version, release, repo_type, messa
     runtime.clone_distgits()
     metas = runtime.image_metas()
     lstate['total'] = len(metas)
+    distgits_to_push = []
 
     for image in metas:
         try:
@@ -352,6 +353,9 @@ def images_update_dockerfile(runtime, stream, version, release, repo_type, messa
             dgr.commit(message)
             dgr.tag(real_version, real_release)
             state.record_image_success(lstate, image)
+            # Only push repos if they have successfully rebased. Otherwise, the gitsha
+            # in the ditgit repo will make us think the image has been built successfully.
+            distgits_to_push.append(image)
         except Exception as ex:
             msg = None
             try:
@@ -365,7 +369,7 @@ def images_update_dockerfile(runtime, stream, version, release, repo_type, messa
 
     try:
         if push:
-            res = runtime.push_distgits()
+            res = runtime.push_distgits(select_distgits=distgits_to_push)
 
             for name, r in res:
                 if r is not True:

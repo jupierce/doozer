@@ -968,14 +968,24 @@ class Runtime(object):
             self.all_metas(),
             n_threads=n_threads).get()
 
-    def push_distgits(self, n_threads=None):
+    def push_distgits(self, n_threads=None, select_distgits=None):
+        """
+        Multi-threaded push of distgit repos.
+        :param n_threads: The number of threads to use
+        :param select_distgits: If specified, limit the number of repos to push. By default, all
+        currently cloned repos are pushed.
+        :return:
+        """
         self.assert_mutation_is_permitted()
+
+        if select_distgits is None:
+            select_distgits = self.all_metas()
 
         if n_threads is None:
             n_threads = self.global_opts['distgit_threads']
         return self._parallel_exec(
             lambda m: m.distgit_repo().push(),
-            self.all_metas(),
+            select_distgits,
             n_threads=n_threads).get()
 
     def parallel_exec(self, f, args, n_threads=None):
