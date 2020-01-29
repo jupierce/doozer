@@ -1570,7 +1570,7 @@ class ImageDistGitRepo(DistGitRepo):
             self.source_full_sha = out.strip()
             rc, out, _ = exectools.cmd_gather("git log -1 --format=%ct")
             self.source_date_epoch = out.strip()
-            rc, out, _ = exectools.cmd_gather("git describe --always --tags HEAD")
+            rc, out, _ = exectools.cmd_gather("git describe --always --tags HEAD --abbrev=0")
             self.source_latest_tag = out.strip()
 
             rc, out, _ = exectools.cmd_gather(["git", "remote", "get-url", "origin"])
