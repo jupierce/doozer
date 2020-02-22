@@ -1,13 +1,11 @@
 from __future__ import absolute_import, print_function, unicode_literals
 from future import standard_library
 standard_library.install_aliases
-import yaml
-import os
 import urllib.parse
 from retry import retry
 import requests
 
-from . import assertion
+from .pushd import Dir
 from .distgit import ImageDistGitRepo, RPMDistGitRepo
 from . import exectools
 from . import logutil
@@ -161,3 +159,43 @@ class Metadata(object):
             component_name = self.config.distgit.component
 
         return component_name
+
+    def get_team_info(self):
+        """
+        :return: Returns a dict of identifying team information. Dict might be empty if none is available.
+        """
+
+        # We are trying to discover some team information that indicates which BZ or Jira board bugs for this
+        # component should be filed against. This information can be stored in the doozer metadata OR
+        # in upstream source. Metadata overrides, as usual.
+
+        source_dir = self.runtime.resolve_source(self)
+
+        # Team info can be defined in metadata, so try there first.
+        bz_component = self.team.bz_component or None
+        team_name = self.team.name or None  # presently should be jira key for team
+
+        # If everything is defined in metadata, don't bother with source
+        if not all((bz_component, team_name)) and source_dir:
+            with Dir(source_dir):
+                security_md_body = ''
+                # Try several files from the upstream master branch to see if we can find what we are looking for.
+                # Why master? Because if a component changes owners, it should not require changes in every branch.
+                for object_name in ['origin/master:SECURITY.MD', 'origin/master:SECURITY.md', 'origin/master:security.md']:
+                    _, out = exectools.cmd_gather(f'git --no-pager show {object_name}')
+                    security_md_body += out
+
+                for line in security_md_body.splitlines():
+                    line = line.strip()
+                    if not bz_component and line.startswith('bz_component='):
+                        bz_component = line.split('=')[1]
+                    if not team_name and line.startswith('team='):
+                        team_name = line.split('=')[1]
+
+        base = {
+            'bz_component': bz_component,
+            'name': team_name,
+        }
+
+        # Filter out any None values
+        return {k: v for k, v in base.items() if v is not None}

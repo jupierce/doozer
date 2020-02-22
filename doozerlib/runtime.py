@@ -1,5 +1,6 @@
 from __future__ import absolute_import, print_function, unicode_literals
 from future import standard_library
+
 standard_library.install_aliases()
 from future.utils import as_native_str
 from multiprocessing import Lock
@@ -70,6 +71,7 @@ def remove_tmp_working_dir(runtime):
 
 class WrapException(Exception):
     """ https://bugs.python.org/issue13831 """
+
     def __init__(self):
         super(WrapException, self).__init__()
         exc_type, exc_value, exc_tb = sys.exc_info()
@@ -84,12 +86,14 @@ class WrapException(Exception):
 
 def wrap_exception(func):
     """ Decorate a function, wrap exception if it occurs. """
+
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
         except Exception:
             raise WrapException()
+
     return wrapper
 
 
@@ -97,10 +101,13 @@ def _unpack_tuple_args(func):
     """ Decorate a function for unpacking the tuple argument `args`
         This is used to workaround Python 3 lambda not unpacking tuple arguments (PEP-3113)
     """
+
     @functools.wraps(func)
     def wrapper(args):
         return func(*args)
+
     return wrapper
+
 
 # ============================================================================
 # Runtime object definition
@@ -328,7 +335,8 @@ class Runtime(object):
                     self.branch = self.group_config.branch
                     self.logger.info("Using branch from group.yml: %s" % self.branch)
                 else:
-                    self.logger.info("No branch specified either in group.yml or on the command line; all included images will need to specify their own.")
+                    self.logger.info(
+                        "No branch specified either in group.yml or on the command line; all included images will need to specify their own.")
             else:
                 self.logger.info("Using branch from command line: %s" % self.branch)
 
@@ -342,7 +350,7 @@ class Runtime(object):
                     except Exception as e:
                         raise ValueError(
                             "could not compile image build log regex for group:\n{}\n{}"
-                            .format(val, e)
+                                .format(val, e)
                         )
                 scanner.matches = regexen
 
@@ -423,14 +431,16 @@ class Runtime(object):
 
             missed_include = set(image_keys + rpm_keys) - set(list(image_data.keys()) + list(rpm_data.keys()))
             if len(missed_include) > 0:
-                raise DoozerFatalError('The following images or rpms were either missing or filtered out: {}'.format(', '.join(missed_include)))
+                raise DoozerFatalError('The following images or rpms were either missing or filtered out: {}'.format(
+                    ', '.join(missed_include)))
 
             if mode in ['images', 'both']:
                 for i in image_data.values():
                     metadata = ImageMetadata(self, i)
                     self.image_map[metadata.distgit_key] = metadata
                 if not self.image_map:
-                    self.logger.warning("No image metadata directories found for given options within: {}".format(self.group_dir))
+                    self.logger.warning(
+                        "No image metadata directories found for given options within: {}".format(self.group_dir))
 
                 for image in self.image_map.values():
                     image.resolve_parent()
@@ -439,7 +449,9 @@ class Runtime(object):
                 for image in self.image_map.values():
                     for child in image.children:
                         if image.is_ancestor(child):
-                            raise DoozerFatalError('{} cannot be both a parent and dependent of {}'.format(child.distgit_key, image.distgit_key))
+                            raise DoozerFatalError(
+                                '{} cannot be both a parent and dependent of {}'.format(child.distgit_key,
+                                                                                        image.distgit_key))
 
                 self.generate_image_tree()
 
@@ -448,7 +460,8 @@ class Runtime(object):
                     metadata = RPMMetadata(self, r, clone_source=clone_source)
                     self.rpm_map[metadata.distgit_key] = metadata
                 if not self.rpm_map:
-                    self.logger.warning("No rpm metadata directories found for given options within: {}".format(self.group_dir))
+                    self.logger.warning(
+                        "No rpm metadata directories found for given options within: {}".format(self.group_dir))
 
         # Make sure that the metadata is not asking us to check out the same exact distgit & branch.
         # This would almost always indicate someone has checked in duplicate metadata into a group.
@@ -456,7 +469,11 @@ class Runtime(object):
         for meta in list(self.rpm_map.values()) + list(self.image_map.values()):
             key = '{}/{}/#{}'.format(meta.namespace, meta.name, meta.branch())
             if key in no_collide_check:
-                raise IOError('Complete duplicate distgit & branch; something wrong with metadata: {} from {} and {}'.format(key, meta.config_filename, no_collide_check[key].config_filename))
+                raise IOError(
+                    'Complete duplicate distgit & branch; something wrong with metadata: {} from {} and {}'.format(key,
+                                                                                                                   meta.config_filename,
+                                                                                                                   no_collide_check[
+                                                                                                                       key].config_filename))
             no_collide_check[key] = meta
 
         # Read in the streams definite for this group if one exists
@@ -529,7 +546,9 @@ class Runtime(object):
         be thrown.
         """
         if self.freeze_automation == FREEZE_AUTOMATION_YES:
-            raise DoozerFatalError('Automation (builds / mutations) for this group is currently frozen (freeze_automation set to {}). Coordinate with the group owner to change this if you believe it is incorrect.'.format(FREEZE_AUTOMATION_YES))
+            raise DoozerFatalError(
+                'Automation (builds / mutations) for this group is currently frozen (freeze_automation set to {}). Coordinate with the group owner to change this if you believe it is incorrect.'.format(
+                    FREEZE_AUTOMATION_YES))
 
     def image_metas(self):
         return list(self.image_map.values())
@@ -727,7 +746,7 @@ class Runtime(object):
 
         return self.streams[stream_name]
 
-    def resolve_source(self, parent, meta):
+    def resolve_source(self, meta):
         """
         Looks up a source alias and returns a path to the directory containing
         that source. Sources can be specified on the command line, or, failing
@@ -735,12 +754,16 @@ class Runtime(object):
         If a source specified in group.yaml has not be resolved before,
         this method will clone that source to checkout the group's desired
         branch before returning a path to the cloned repo.
-        :param parent: Name of parent the source belongs to
         :param meta: The MetaData object to resolve source for
-        :return: Returns the source path
+        :return: Returns the source path or None if upstream source is not defined
         """
 
         source = meta.config.content.source
+
+        if not source:
+            return None
+
+        parent = f'{meta.namespace}_{meta.name}'
 
         # This allows passing `--source <distgit_key> path` to
         # override any source to something local without it
@@ -766,7 +789,7 @@ class Runtime(object):
         if alias in self.source_paths:
             self.logger.debug(
                 "returning previously resolved path for alias {}: {}".
-                format(alias, self.source_paths[alias]))
+                    format(alias, self.source_paths[alias]))
             return self.source_paths[alias]
 
         # Where the source will land, check early so we know if old or new style
@@ -774,8 +797,9 @@ class Runtime(object):
         source_dir = os.path.join(self.sources_dir, sub_path)
 
         if not source_details:  # old style alias was given
-            if (self.group_config.sources is Missing or alias not in self.group_config.sources):
-                raise DoozerFatalError("Source alias not found in specified sources or in the current group: %s" % alias)
+            if self.group_config.sources is Missing or alias not in self.group_config.sources:
+                raise DoozerFatalError(
+                    "Source alias not found in specified sources or in the current group: %s" % alias)
             source_details = self.group_config.sources[alias]
 
         self.logger.debug("checking for source directory in source_dir: {}".
@@ -787,7 +811,7 @@ class Runtime(object):
             self.source_paths[alias] = source_dir
             self.logger.info(
                 "Source '{}' already exists in (skipping clone): {}".
-                format(alias, source_dir))
+                    format(alias, source_dir))
             return source_dir
 
         clone_branch, _ = self.detect_remote_source_branch(source_details)
@@ -801,11 +825,13 @@ class Runtime(object):
             self.logger.info("Attempting to checkout source '%s' branch %s in: %s" % (url, clone_branch, source_dir))
             exectools.cmd_assert(
                 # get a little history to enable finding a recent Dockerfile change, but not too much.
-                "git clone -b {} --single-branch {} --depth 50 {}".format(clone_branch, url, source_dir),
+                # clone all remote branches so that rebasing can find information in any branch it needs to.
+                "git clone -b {} --depth 50 {}".format(clone_branch, url, source_dir),
                 set_env=set_env,
                 retries=3,
                 on_retry=["rm", "-rf", source_dir],
             )
+
         except IOError as e:
             self.logger.info("Unable to checkout branch {}: {}".format(clone_branch, str(e)))
             raise DoozerFatalError("Error checking out target branch of source '%s' in: %s" % (alias, source_dir))
@@ -834,7 +860,8 @@ class Runtime(object):
             result = self._get_remote_branch_ref(git_url, stage_branch)
             if result:
                 return stage_branch, result
-            raise DoozerFatalError('--stage option specified and no stage branch named "{}" exists for {}'.format(stage_branch, git_url))
+            raise DoozerFatalError(
+                '--stage option specified and no stage branch named "{}" exists for {}'.format(stage_branch, git_url))
 
         result = self._get_remote_branch_ref(git_url, branch)
         if result:
@@ -842,7 +869,8 @@ class Runtime(object):
         elif not fallback_branch:
             raise DoozerFatalError('Requested target branch {} does not exist and no fallback provided'.format(branch))
 
-        self.logger.info('Target branch does not exist in {}, checking fallback branch {}'.format(git_url, fallback_branch))
+        self.logger.info(
+            'Target branch does not exist in {}, checking fallback branch {}'.format(git_url, fallback_branch))
         result = self._get_remote_branch_ref(git_url, fallback_branch)
         if result:
             return fallback_branch, result
@@ -859,15 +887,14 @@ class Runtime(object):
         result = out.strip()  # any result means the branch is found
         return result.split()[0] if result else None
 
-    def resolve_source_head(self, parent, meta):
+    def resolve_source_head(self, meta):
         """
         Attempts to resolve the branch a given source alias has checked out. If not on a branch
         returns SHA of head.
-        :param parent: Name of parent requesting the source
         :param meta: The MetaData object to resolve source for
         :return: The name of the checked out branch or None (if required=False)
         """
-        source_dir = self.resolve_source(parent, meta)
+        source_dir = self.resolve_source(meta)
 
         if not source_dir:
             return None

@@ -51,8 +51,8 @@ class RPMMetadata(Metadata):
         self.build_status = False
 
         if clone_source:
-            self.source_path = self.runtime.resolve_source('rpm_{}'.format(self.rpm_name), self)
-            self.source_head = self.runtime.resolve_source_head('rpm_{}'.format(self.rpm_name), self)
+            self.source_path = self.runtime.resolve_source(self)
+            self.source_head = self.runtime.resolve_source_head(self)
             if self.source.specfile:
                 self.specfile = os.path.join(self.source_path, self.source.specfile)
                 if not os.path.isfile(self.specfile):
@@ -219,11 +219,18 @@ class RPMMetadata(Metadata):
             # tito tag will handle updating specfile
             return
 
+        packager = 'OpenShift ART'
+        team_info = self.get_team_info()
+        if team_info:
+            packager += ' for: '
+            ', '.join(f"team_{k}={v}" for (k, v) in team_info.items())
+
         # otherwise, make changes similar to tito tagging
-        replace = {
+        rpm_spec_tags = {
             'Name:': 'Name:           {}\n'.format(self.config.name),
             'Version:': 'Version:        {}\n'.format(self.version),
             'Release:': 'Release:        {}%{{?dist}}\n'.format(self.release),
+            'Packager: ': packager,
         }
 
         # self.version example: 3.9.0
@@ -237,8 +244,6 @@ class RPMMetadata(Metadata):
         # release full version: v3.9.0
         if self.release.startswith("0."):
             full += "-{}".format(self.release)
-
-        replace_keys = list(replace.keys())
 
         with Dir(self.source_path):
             commit_sha = exectools.cmd_assert('git rev-parse HEAD')[0].strip()
@@ -259,13 +264,17 @@ class RPMMetadata(Metadata):
                     elif "%global commit" in lines[i]:
                         lines[i] = re.sub(r'commit\s+\w+', "commit {}".format(commit_sha), lines[i])
 
-                    elif replace_keys:  # If there are keys left to replace
-                        for k in replace_keys:
-                            v = replace[k]
+                    elif rpm_spec_tags:  # If there are keys left to replace
+                        for k in list(rpm_spec_tags.keys()):
+                            v = rpm_spec_tags[k]
                             if lines[i].startswith(k):
                                 lines[i] = v
-                                replace_keys.remove(k)
+                                del rpm_spec_tags[k]
                                 break
+
+                # If there are still rpm tags to inject, do so
+                for v in rpm_spec_tags.values():
+                    lines.insert(0, v)
 
                 # truncate the original file
                 sf.seek(0)
