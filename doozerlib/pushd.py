@@ -54,7 +54,7 @@ class Dir(object):
         self._tl.cwd = self.previous_dir
 
     @classmethod
-    def getcwd(cls):
+    def getcwd(cls) -> str:
         """
         Provide a context dependent current working directory. This method
         will return the directory currently holding the lock.
@@ -64,7 +64,7 @@ class Dir(object):
         return cls._tl.cwd
 
     @classmethod
-    def getpath(cls):
+    def getpath(cls) -> pathlib.Path:
         """
         Provide a context dependent current working directory. This method
         will return a pathlib.Path for the directory currently holding the lock.

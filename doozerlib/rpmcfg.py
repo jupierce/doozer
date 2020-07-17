@@ -62,19 +62,18 @@ class RPMMetadata(Metadata):
         self.extra_os_git_vars = {}
 
         if clone_source:
-            self.source_path = self.runtime.resolve_source(self)
-            self.source_head = self.runtime.resolve_source_head(self)
-            with Dir(self.source_path):
+            self.source_head = util.resolve_git_head(self.source_path())
+            with Dir(self.source_path()):
                 # gather source repo short sha for audit trail
                 out, _ = exectools.cmd_assert(["git", "rev-parse", "HEAD"])
                 source_full_sha = out.strip()
 
                 # Determine if the source contains private fixes by checking if the private org branch commit exists in the public org
-                if self.public_upstream_branch:
-                    self.private_fix = not util.is_commit_in_public_upstream(source_full_sha, self.public_upstream_branch, self.source_path)
+                if self.get_source_details().has_private_upstream():
+                    self.private_fix = not util.is_commit_in_public_upstream(source_full_sha, self._source_details.get_public_git_branch(), self.source_path())
 
                 # If this is a go project, parse the Godeps for points of interest
-                godeps_file = pathlib.Path(self.source_path, 'Godeps', 'Godeps.json')
+                godeps_file = pathlib.Path(self.source_path(), 'Godeps', 'Godeps.json')
                 if godeps_file.is_file():
                     try:
                         with open(str(godeps_file)) as f:
@@ -98,22 +97,22 @@ class RPMMetadata(Metadata):
                         traceback.print_exc()
 
             if self.source.specfile:
-                self.specfile = os.path.join(self.source_path, self.source.specfile)
+                self.specfile = os.path.join(self.source_path(), self.source.specfile)
                 if not os.path.isfile(self.specfile):
                     raise ValueError('{} config specified a spec file that does not exist: {}'.format(
                         self.config_filename, self.specfile
                     ))
             else:
-                with Dir(self.source_path):
+                with Dir(self.source_path()):
                     specs = []
                     for spec in glob.glob('*.spec'):
                         specs.append(spec)
                     if len(specs) > 1:
                         raise ValueError('More than one spec file found. Specify correct file in config yaml')
                     elif len(specs) == 0:
-                        raise ValueError('Unable to find any spec files in {}'.format(self.source_path))
+                        raise ValueError('Unable to find any spec files in {}'.format(self.source_path()))
                     else:
-                        self.specfile = os.path.join(self.source_path, specs[0])
+                        self.specfile = os.path.join(self.source_path(), specs[0])
 
     def set_nvr(self, version, release):
         self.version = version
@@ -124,7 +123,7 @@ class RPMMetadata(Metadata):
         if not self.tag:
             raise ValueError('Must run set_nvr() before calling!')
 
-        with Dir(self.source_path):
+        with Dir(self.source_path()):
             exectools.cmd_assert('git push origin --tags', retries=3)
 
     def commit_changes(self, scratch):
@@ -136,7 +135,7 @@ class RPMMetadata(Metadata):
         # If we don't push it, we want to revert the commit so that subsequent
         # rpm / image builds don't think the sha is valid in origin.
 
-        with Dir(self.source_path):
+        with Dir(self.source_path()):
             if self.config.content.build.use_source_tito_config:
                 # just use the tito tagger to change spec and tag
                 exectools.cmd_assert([
@@ -157,7 +156,7 @@ class RPMMetadata(Metadata):
 
     def post_build(self, scratch):
         build_spec = self.config.content.build
-        with Dir(self.source_path):
+        with Dir(self.source_path()):
 
             valid_build = self.build_status and not scratch
 
@@ -185,13 +184,13 @@ class RPMMetadata(Metadata):
         if self.config.content.build.use_source_tito_config:
             return  # rely on tito already set up in source
 
-        tito_dir = os.path.join(self.source_path, '.tito')
+        tito_dir = os.path.join(self.source_path(), '.tito')
         tito_target = self.config.content.build.tito_target
         tito_target = tito_target if tito_target else 'aos'
         tito_dist = self.config.content.build.tito_dist
         tito_dist = tito_dist if tito_dist else '.el7aos'
 
-        with Dir(self.source_path):
+        with Dir(self.source_path()):
 
             # We either use .tito from source or we don't. If you want to use the upstream
             # source, use self.config.content.build.use_source_tito_config=True. Otherwise, we
@@ -223,8 +222,8 @@ class RPMMetadata(Metadata):
             # one was specifically identified in the metadata, rename those
             # which we are not targeting. Tito/brew do not handle multiple .specs.
             if self.source.specfile is not Missing:
-                for f in os.listdir(self.source_path):
-                    found_path = os.path.join(self.source_path, f)
+                for f in os.listdir(self.source_path()):
+                    found_path = os.path.join(self.source_path(), f)
                     if os.path.isfile(found_path) and found_path.endswith('.spec') and found_path != self.specfile:
                         self.logger.info('Renaming extraneous spec file before build: {} (only want {})'.format(f, self.source.specfile))
                         os.rename(found_path, '{}.ignore'.format(found_path))
@@ -297,7 +296,7 @@ class RPMMetadata(Metadata):
         if self.release.startswith("0."):
             full += "-{}".format(self.release)
 
-        with Dir(self.source_path):
+        with Dir(self.source_path()):
             commit_sha = exectools.cmd_assert('git rev-parse HEAD')[0].strip()
 
             # run generic modifications first
@@ -352,7 +351,7 @@ class RPMMetadata(Metadata):
         The part of `build_container` which actually starts the build,
         separated for clarity.
         """
-        with Dir(self.source_path):
+        with Dir(self.source_path()):
             self.logger.info("Building rpm: %s" % self.rpm_name)
 
             cmd_list = ['tito', 'release', '--debug', '--yes', '--test']
@@ -435,9 +434,9 @@ class RPMMetadata(Metadata):
         if self.private_fix:
             self.logger.warning("Source contains embargoed fixes.")
 
-        with self.runtime.get_named_lock(self.source_path):
+        with self.runtime.get_named_lock(self.source_path()):
 
-            with Dir(self.source_path):
+            with Dir(self.source_path()):
                 # Remember what we were at before tito activity. We may need to revert
                 # to this if we don't push changes back to origin.
                 self.pre_init_sha = exectools.cmd_assert('git rev-parse HEAD')[0].strip()

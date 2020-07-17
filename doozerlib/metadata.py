@@ -1,18 +1,19 @@
 from __future__ import absolute_import, print_function, unicode_literals
 from future import standard_library
 standard_library.install_aliases
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import urllib.parse
-from retry import retry
-import requests
 import yaml
+import os
+import io
 from collections import OrderedDict
 
 from .pushd import Dir
-from .distgit import ImageDistGitRepo, RPMDistGitRepo
+from .distgit import ImageDistGitRepo, RPMDistGitRepo, DistGitRepo
 from . import exectools
 from . import logutil
-
+from . import assertion
+from doozerlib import util
 from .model import Model, Missing
 
 #
@@ -47,10 +48,6 @@ class Metadata(object):
         self.config_filename = data_obj.filename
         self.full_config_path = data_obj.path
         self.commitish = commitish
-
-        # URL and branch of public upstream source are set later by Runtime.resolve_source()
-        self.public_upstream_url = None
-        self.public_upstream_branch = None
 
         # Some config filenames have suffixes to avoid name collisions; strip off the suffix to find the real
         # distgit repo name (which must be combined with the distgit namespace).
@@ -94,6 +91,7 @@ class Metadata(object):
         self.logger = logutil.EntityLoggingAdapter(logger=self.runtime.logger, extra={'entity': self.qualified_key})
 
         self._distgit_repo = None
+        self._source_details = SourceDetails(self)
 
     def save(self):
         self.data_obj.data = self.config.primitive()
@@ -106,7 +104,7 @@ class Metadata(object):
             return f'ssh://{self.runtime.user}@{pkgs_host}/{self.qualified_name}'
         return f'ssh://{pkgs_host}/{self.qualified_name}'
 
-    def distgit_repo(self, autoclone=True):
+    def distgit_repo(self, autoclone=True) -> DistGitRepo:
         if self._distgit_repo is None:
             self._distgit_repo = DISTGIT_TYPES[self.meta_type](self, autoclone=autoclone)
         return self._distgit_repo
@@ -118,6 +116,10 @@ class Metadata(object):
 
     def candidate_brew_tag(self):
         return '{}-candidate'.format(self.branch())
+
+    def has_source(self):
+        return "git" in self.config.content.source or \
+               "alias" in self.config.content.source
 
     def get_arches(self):
         """
@@ -164,6 +166,21 @@ class Metadata(object):
                     return default
                 raise IOError("No builds detected for %s using tag: %s" % (self.qualified_name, self.candidate_brew_tag()))
             return builds[0]
+
+    def source_path(self) -> str:
+        """
+        :return: Returns the directory containing the upstream source which should be used to populate distgit.
+        """
+
+        source_root = self.runtime.resolve_source(self)
+        sub_path = self.config.content.source.path
+
+        path = source_root
+        if sub_path is not Missing:
+            path = os.path.join(source_root, sub_path)
+
+        assertion.isdir(path, "Unable to find path for source [%s] for config: %s" % (path, self.config_filename))
+        return path
 
     def get_latest_build_info(self, default=-1):
         """
@@ -217,7 +234,7 @@ class Metadata(object):
 
         one_hour = (1 * 60 * 60 * 1000)  # in milliseconds
 
-        if not dgr.has_source():
+        if not self.has_source():
             if distgit_head_commit_millis > latest_build_creation_ts:
                 # Two options:
                 # 1. A user has made a commit to this dist-git only branch and there has been no build attempt
@@ -228,7 +245,7 @@ class Metadata(object):
             return False, 'Distgit only repo commit is older than most recent build'
 
         # We have source.
-        with Dir(dgr.source_path()):
+        with Dir(self.source_path()):
             ts, _ = exectools.cmd_assert('git show -s --format=%ct HEAD')
             upstream_source_head_commit_millis = int(ts)
 
@@ -247,6 +264,12 @@ class Metadata(object):
             else:
                 # The latest build is newer than the latest distgit commit. No change required.
                 return False, 'Latest build is newer than latest distgit commit -- no build required'
+
+    def get_source_details(self) -> 'SourceDetails':
+        """"
+        :return: Returns a SourceDetails class with information about this Metadata's source repositories.
+        """
+        return self._source_details
 
     def get_maintainer_info(self):
         """
@@ -299,3 +322,112 @@ class Metadata(object):
                 sorted_maintainer[k] = maintainer[k]
 
         return sorted_maintainer
+
+
+class SourceDetails(object):
+
+    def __init__(self, metadata: Metadata):
+        self.meta = metadata
+        self.runtime = metadata.runtime
+        self.logger = self.meta.logger
+
+        self.source_git_url = None
+        self.source_git_branch = None
+        self.public_source_git_url = None
+        self.public_source_git_branch = None
+
+        self.source_repo_name = None
+        self.source_repo_org = None
+        self.public_repo_name = None
+        self.public_repo_org = None
+
+        source_config = self.meta.config.content.source
+        if not source_config:
+            return None
+
+        if 'git' in source_config:
+            source_config = dict(source_config.git)
+        elif 'alias' in source_config:
+            alias = source_config.alias
+            if self.runtime.group_config.sources is Missing or alias not in self.runtime.group_config.sources:
+                raise IOError("Source alias not found in specified sources or in the current group: %s" % alias)
+            source_config = self.group_config.sources[alias]
+
+        if source_config:
+            git_url = source_config["url"]
+            branches = source_config["branch"]
+
+            branch = branches["target"]
+            fallback_branch = branches.get("fallback", None)
+
+            result = util.get_remote_branch_ref(git_url, branch, self.logger)
+            self.source_git_url = git_url
+            if result:
+                self.source_git_branch = branch
+            else:
+                if not fallback_branch:
+                    raise IOError(f'Requested target branch {branch} of {git_url} does not exist and no fallback provided')
+                else:
+                    result = util.get_remote_branch_ref(git_url, fallback_branch, self.logger)
+                    if not result:
+                        raise IOError(f'Requested target branch {branch} and {fallback_branch} of {git_url} do not exist')
+                    self.source_git_branch = fallback_branch
+
+            self.public_source_git_url, self.public_source_git_branch = self.runtime.get_public_upstream(self.source_git_url)
+            if not self.public_source_git_branch:  # default to the same branch name as private upstream
+                self.public_source_git_branch = self.source_git_branch
+
+            self.source_repo_org, self.source_repo_name = util.parse_git_url_components(self.get_source_git_url())
+            self.public_repo_org, self.public_repo_name = util.parse_git_url_components(self.get_public_git_url())
+
+    @staticmethod
+    def _format_url(git_url, as_https):
+        if not git_url:
+            return None
+        if as_https:
+            return util.convert_remote_git_to_https(git_url)
+        else:
+            return util.convert_remote_git_to_ssh(git_url)
+
+    def get_source_git_url(self, as_https=False) -> str:
+        """
+        :param as_https: If True, repo url will be returned as https URL. If False, returns in ssh mode.
+        :return: Returns the upstream source repository URL
+        """
+        return SourceDetails._format_url(self.source_git_url, as_https=as_https)
+
+    def get_source_git_branch(self) -> str:
+        """
+        :return: Returns the upstream source branch
+        """
+        return self.source_git_branch
+
+    def get_public_git_url(self, as_https=False) -> str:
+        """
+        :param as_https: If True, repo url will be returned as https URL. If False, returns in ssh mode.
+        :return: Returns the public source git url. This will be identical to get_source_git_url
+                if the metadata does not have a different public upstream.
+        """
+        return SourceDetails._format_url(self.public_source_git_url, as_https=as_https)
+
+    def get_public_git_branch(self) -> str:
+        """
+        :return: Returns the public source git branch. This will be identical to get_source_git_branch
+                if the metadata does not have a different public upstream.
+        """
+        return self.public_source_git_branch
+
+    def get_source_repo_components(self) -> Tuple[str, str]:
+        """
+        :return: Returns a tuple of the upstream source (git_repo, git_repo) names
+        """
+        return self.source_repo_org, self.source_repo_name
+
+    def get_public_repo_components(self) -> Tuple[str, str]:
+        """
+        :return: Returns a tuple of the public upstream (git_repo, git_repo) names
+        """
+        return self.public_repo_org, self.public_repo_name
+
+    def has_private_upstream(self):
+        return self.get_source_git_url() != self.get_public_git_url() or self.get_source_git_branch() != self.get_public_git_branch()

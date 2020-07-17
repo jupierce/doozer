@@ -7,16 +7,12 @@ import traceback
 import errno
 from multiprocessing import Lock
 import yaml
-import logging
 import bashlex
-import glob
 import re
 import io
 import copy
 import pathlib
 import json
-from datetime import datetime, timedelta
-import koji
 
 from dockerfile_parse import DockerfileParser
 
@@ -87,7 +83,7 @@ def build_image_ref_name(name):
 
 class DistGitRepo(object):
     def __init__(self, metadata, autoclone=True):
-        self.metadata = metadata
+        self.metadata: 'Metadata' = metadata
         self.config = metadata.config
         self.runtime = metadata.runtime
         self.name = self.metadata.name
@@ -210,28 +206,6 @@ class DistGitRepo(object):
             on_retry=['git', 'reset', '--hard', target],  # in case merge failed due to storage
         )
 
-    def has_source(self):
-        """
-        Check whether this dist-git repo has source content
-        """
-        return "git" in self.config.content.source or \
-               "alias" in self.config.content.source
-
-    def source_path(self):
-        """
-        :return: Returns the directory containing the source which should be used to populate distgit.
-        """
-
-        source_root = self.runtime.resolve_source(self.metadata)
-        sub_path = self.config.content.source.path
-
-        path = source_root
-        if sub_path is not Missing:
-            path = os.path.join(source_root, sub_path)
-
-        assertion.isdir(path, "Unable to find path for source [%s] for config: %s" % (path, self.metadata.config_filename))
-        return path
-
     def commit(self, commit_message, log_diff=False):
         if self.runtime.local:
             return ''  # no commits if local
@@ -268,6 +242,9 @@ class DistGitRepo(object):
         with Dir(self.distgit_dir):
             self.logger.info("Adding tag to local repo: {}".format(tag))
             exectools.cmd_gather(["git", "tag", "-f", tag, "-m", tag])
+
+    def source_path(self):
+        return self.metadata.source_path()
 
 
 class ImageDistGitRepo(DistGitRepo):
@@ -378,8 +355,8 @@ class ImageDistGitRepo(DistGitRepo):
 
         # generate container.yaml content for ODCS
         config = {}
-        if self.has_source():  # if upstream source provides container.yaml, load it.
-            source_container_yaml = os.path.join(self.source_path(), 'container.yaml')
+        if self.metadata.has_source():  # if upstream source provides container.yaml, load it.
+            source_container_yaml = os.path.join(self.metadata.source_path(), 'container.yaml')
             if os.path.isfile(source_container_yaml):
                 with open(source_container_yaml, 'r') as scy:
                     config = yaml.full_load(scy)
@@ -1759,7 +1736,7 @@ class ImageDistGitRepo(DistGitRepo):
         # Initialize env_vars_from source.
         # update_distgit_dir makes a distinction between None and {}
         self.env_vars_from_source = {}
-        source_dir = self.source_path()
+        source_dir = self.metadata.source_path()
         with Dir(source_dir):
             if self.metadata.commitish:
                 self.runtime.logger.info(f"Rebasing image {self.name} from speicified commit-ish {self.metadata.commitish}...")
@@ -1775,16 +1752,15 @@ class ImageDistGitRepo(DistGitRepo):
             rc, out, _ = exectools.cmd_gather("git describe --always --tags HEAD")
             self.source_latest_tag = out.strip()
 
-            out, _ = exectools.cmd_assert(["git", "remote", "get-url", "origin"])
-            out = out.strip()
-            self.source_url, _ = self.runtime.get_public_upstream(out)  # Point to public upstream if there are private components to the URL
+            self.source_url, _ = self.metadata.get_source_details().get_public_git_url(as_https=True)
 
-            # If private_fix has not already been set (e.g. by --embargoed), determine if the source contains private fixes by checking if the private org branch commit exists in the public org
-            if self.private_fix is None and self.metadata.public_upstream_branch:
-                self.private_fix = not util.is_commit_in_public_upstream(self.source_full_sha, self.metadata.public_upstream_branch, source_dir)
+            # If private_fix has not already been set (e.g. by --embargoed), determine if the source contains
+            # private fixes by checking if the private org branch commit exists in the public org
+            if self.private_fix is None and self.metadata.get_source_details().has_private_upstream():
+                self.private_fix = not util.is_commit_in_public_upstream(self.source_full_sha, self.metadata.get_source_details().get_public_git_branch(), source_dir)
 
             # If this is a go project, parse the Godeps for points of interest
-            godeps_file = pathlib.Path(self.source_path(), 'Godeps', 'Godeps.json')
+            godeps_file = pathlib.Path(self.metadata.source_path(), 'Godeps', 'Godeps.json')
             if godeps_file.is_file():
                 try:
                     with godeps_file.open('r', encoding='utf-8') as f:
@@ -1807,15 +1783,10 @@ class ImageDistGitRepo(DistGitRepo):
                     self.runtime.logger.error(f'Error parsing godeps {str(godeps_file)}')
                     traceback.print_exc()
 
-        # See if the config is telling us a file other than "Dockerfile" defines the
-        # distgit image content.
-        if self.config.content.source.dockerfile is not Missing:
-            dockerfile_name = self.config.content.source.dockerfile
-        else:
-            dockerfile_name = "Dockerfile"
+        dockerfile_name = self.metadata.get_source_dockerfile_name()
 
         # The path to the source Dockerfile we are reconciling against
-        source_dockerfile_path = os.path.join(self.source_path(), dockerfile_name)
+        source_dockerfile_path = os.path.join(self.metadata.source_path(), dockerfile_name)
 
         # Clean up any files not special to the distgit repo
         ignore_list = BASE_IGNORE
@@ -1835,7 +1806,7 @@ class ImageDistGitRepo(DistGitRepo):
                 shutil.rmtree(str(ent.resolve()))
 
         # Copy all files and overwrite where necessary
-        recursive_overwrite(self.source_path(), self.distgit_dir)
+        recursive_overwrite(self.metadata.source_path(), self.distgit_dir)
 
         if dockerfile_name != "Dockerfile":
 
@@ -1886,7 +1857,7 @@ class ImageDistGitRepo(DistGitRepo):
         if not notify_owner:
             return
 
-        with Dir(self.source_path()):
+        with Dir(self.metadata.source_path()):
             author_email = None
             err = None
             rc, sha, err = exectools.cmd_gather(
@@ -2003,7 +1974,7 @@ class ImageDistGitRepo(DistGitRepo):
             util.mkdirs(dg_path.joinpath('.oit'))
 
             # If content.source is defined, pull in content from local source directory
-            if self.has_source():
+            if self.metadata.has_source():
                 self._merge_source()
 
                 # before mods, check if upstream source version should be used

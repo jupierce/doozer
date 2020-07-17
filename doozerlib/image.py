@@ -221,6 +221,14 @@ class ImageMetadata(Metadata):
 
         return push_names
 
+    def get_source_dockerfile_name(self) -> str:
+        # See if the config is telling us a file other than "Dockerfile" defines the
+        # distgit image content.
+        if self.config.content.source.dockerfile is not Missing:
+            return self.config.content.source.dockerfile
+        else:
+            return "Dockerfile"
+
     # Class methods to speed up computation of does_image_need_change if multiple
     # images will be assessed.
     # Mapping of brew pullspec => most recent brew build dict.

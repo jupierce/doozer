@@ -46,7 +46,6 @@ def print_version(ctx, param, value):
               help="The group of images on which to operate. Env var: DOOZER_GROUP")
 @click.option("--branch", default=None, metavar='BRANCH',
               help="DistGit to override any default in group.yml.")
-@click.option('--stage', default=False, is_flag=True, help='Force checkout stage branch for sources in group.yml.')
 @click.option("-i", "--images", default=[], metavar='NAME', multiple=True,
               help="Name of group image member to include in operation (all by default). Can be comma delimited list.")
 @click.option("-r", "--rpms", default=[], metavar='NAME', multiple=True,

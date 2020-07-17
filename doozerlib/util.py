@@ -2,13 +2,15 @@ from __future__ import absolute_import, print_function, unicode_literals
 import click
 import copy
 import os
+import io
 import errno
 import re
-from typing import Dict
+import urllib
 from datetime import datetime
 from contextlib import contextmanager
 from inspect import getframeinfo, stack
 from doozerlib import exectools, constants
+from typing import Tuple, Dict
 
 
 def stringify(val):
@@ -81,21 +83,27 @@ def dict_get(dct, path, default=DICT_EMPTY):
     return dct
 
 
-def convert_remote_git_to_https(source):
+def convert_remote_git_to_https(git_url):
     """
     Accepts a source git URL in ssh or https format and return it in a normalized
     https format:
         - https protocol
         - no trailing /
-    :param source: Git remote
+    :param git_url: Git remote URL
     :return: Normalized https git URL
     """
     url = re.sub(
         pattern=r'[^@]+@([^:/]+)[:/]([^\.]+)',
         repl='https://\\1/\\2',
-        string=source.strip(),
+        string=git_url.strip(),
     )
     return re.sub(string=url, pattern=r'\.git$', repl='').rstrip('/')
+
+
+def convert_remote_git_to_ssh(source):
+    https_version = convert_remote_git_to_https(source)
+    splits = https_version.split('/')
+    return f'git@{splits[-3]}:{splits[-2]}/{splits[-1]}.git'
 
 
 def setup_and_fetch_public_upstream_source(public_source_url: str, public_upstream_branch: str, source_dir: str):
@@ -122,7 +130,7 @@ def is_commit_in_public_upstream(revision: str, public_upstream_branch: str, sou
     :param public_upstream_branch: Git branch of the public upstream source
     :param source_dir: Path to the local Git repository
     """
-    cmd = ["git", "merge-base", "--is-ancestor", "--", revision, "public_upstream/" + public_upstream_branch]
+    cmd = ["git", "-C", source_dir, "merge-base", "--is-ancestor", "--", revision, "public_upstream/" + public_upstream_branch]
     # The command exits with status 0 if true, or with status 1 if not. Errors are signaled by a non-zero status that is not 1.
     # https://git-scm.com/docs/git-merge-base#Documentation/git-merge-base.txt---is-ancestor
     rc, out, err = exectools.cmd_gather(cmd)
@@ -130,7 +138,7 @@ def is_commit_in_public_upstream(revision: str, public_upstream_branch: str, sou
         return True
     if rc == 1:
         return False
-    raise IOError(f"Couldn't determine if the commit {revision} is in the public upstream source repo. `git fetch` exited with {rc}, stdout={out}, stderr={err}")
+    raise IOError(f"Couldn't determine if the commit {revision} is in the public upstream source repo in {source_dir}. `git fetch` exited with {rc}, stdout={out}, stderr={err}")
 
 
 def is_in_directory(path, directory):
@@ -265,3 +273,58 @@ def get_cincinnati_channels(major, minor):
         prefixes = ['prerelease', 'stable']
 
     return [f'{prefix}-{major}.{minor}' for prefix in prefixes]
+
+
+def get_remote_branch_ref(git_url: str, branch: str, logger):
+    """
+    Detect whether a single branch exists on a remote repo; returns git hash if found or None if not
+    :param git_url: The git url to query
+    :param branch: The branch name to detect
+    :param logger: Logger of output
+    :return: The git hash of the branch or None
+    """
+    """"""
+    if logger:
+        logger.info('Checking if target branch {} exists in {}'.format(branch, git_url))
+    try:
+        out, _ = exectools.cmd_assert('git ls-remote --heads {} {}'.format(git_url, branch), retries=3)
+    except Exception as err:
+        if logger:
+            logger.error('Unable to check if target branch {} exists: {}'.format(branch, err))
+        return None
+    result = out.strip()  # any result means the branch is found
+    return result.split()[0] if result else None
+
+
+def resolve_git_head(git_dir):
+    """
+    Resolves the current HEAD into a branch name or commit hash
+    :param git_dir: The locally checked out git repository.
+    :return: The name of the checked out branch or the current commit hash. Returns None if
+    it cannot be resolved.
+    """
+    if not git_dir:
+        return None
+
+    with io.open(os.path.join(git_dir, '.git/HEAD'), encoding="utf-8") as f:
+        head_content = f.read().strip()
+        # This will either be:
+        # a SHA like: "52edbcd8945af0dc728ad20f53dcd78c7478e8c2"
+        # a local branch name like: "ref: refs/heads/master"
+        if head_content.startswith("ref:"):
+            return head_content.split('/', 2)[2]  # limit split in case branch name contains /
+
+        # Otherwise, just return SHA
+        return head_content
+
+
+def parse_git_url_components(git_url: str) -> Tuple[str, str]:
+    """
+    :param git_url: The url to parse
+    :return: Returns a tuple (org, repo)
+    """
+    https_url = convert_remote_git_to_https(git_url)
+    git_url = urllib.parse.urlparse(https_url)
+    repo_name = os.path.splitext(os.path.basename(git_url.path))[0]
+    repo_org = os.path.basename(os.path.dirname(git_url.path))
+    return repo_org, repo_name

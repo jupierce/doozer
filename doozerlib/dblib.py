@@ -6,6 +6,7 @@ import threading
 import hashlib
 import boto3
 import traceback
+from typing import Dict
 from .model import Missing
 
 # Records need unique names. Use this int atomically for extra protection.
@@ -14,7 +15,7 @@ record_sequence = 0
 
 class DB(object):
 
-    def __init__(self, runtime, environment, dry_run=False):
+    def __init__(self, runtime, environment: str, dry_run: bool = False):
         """
         :param runtime: The runtime
         :param environment: int / stage / prod  for database environment. None will not write any data.
@@ -39,7 +40,7 @@ class DB(object):
                 traceback.print_exc()
                 runtime.logger.error('Unable to acquire simpledb client; please check AWS creds')
 
-    def create_domain_if_missing(self, domain):
+    def create_domain_if_missing(self, domain: str):
         if self.client:
             with self.lock:
                 if domain in self.existing_domains:
@@ -50,10 +51,10 @@ class DB(object):
                 )
                 self.existing_domains[domain] = True
 
-    def record(self, operation, metadata=None, dry_run=False):
+    def record(self, operation: str, metadata: 'Metadata' = None, dry_run: bool = False) -> 'Record':
         """
         :param operation: The type of operation being tracked
-        :param metadata: Distgit metadata if any
+        :param metadata: ImageMetadata or RPMMetadata if available
         :param dry_run: If true, this record will not be written to the datastore. e.g. scratch builds.
         :return:
         """
@@ -69,7 +70,7 @@ class DB(object):
 
         return Record(self, domain, extras, dry_run)
 
-    def select(self, expression, consistent_read=True, limit=0):
+    def select(self, expression: str, consistent_read: bool = True, limit: int = 0):
         """
         https://docs.aws.amazon.com/AmazonSimpleDB/latest/DeveloperGuide/UsingSelect.html
         :param expression: Select expression to execute
@@ -125,7 +126,7 @@ class Record(object):
 
     _tl = threading.local()
 
-    def __init__(self, db, domain, extras={}, dry_run=False):
+    def __init__(self, db: DB, domain: str, extras: Dict[str, str] = {}, dry_run: bool =False):
         global record_sequence
         self.previous_record = None
         self.domain = domain
@@ -187,7 +188,7 @@ class Record(object):
         self._tl.record = self.previous_record
 
     @classmethod
-    def set(cls, name, value):
+    def set(cls, name: str, value: str):
         """
         Sets an attribute name=value for the most recent Record context
         :param name: The name of the attribute to set (limit 1024 chars)
@@ -200,7 +201,7 @@ class Record(object):
         cls._tl.record.attrs[name] = value
 
     @classmethod
-    def update(cls, a_dict):
+    def update(cls, a_dict: Dict[str, str]):
         """
         Sets attributes for the most recent Record context
         :param a_dict: key / values to set
@@ -212,9 +213,9 @@ class Record(object):
         cls._tl.record.attrs.update(a_dict)
 
     @classmethod
-    def current(cls):
+    def current(cls) -> 'Record':
         """
-        :return: Returns the current Record object or None
+        :return: Returns the current DB Record object or None
         """
         if not hasattr(cls._tl, "record"):
             return None

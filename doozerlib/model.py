@@ -109,6 +109,8 @@ class ListModel(list):
     def primitive(self):
         lst = []
         for e in self:
+            if isinstance(e, Model) or isinstance(e, ListModel):
+                e = e.primitive()
             lst.append(e)
         return lst
 
@@ -148,6 +150,9 @@ class Model(dict):
         """ Recursively turn Model into dicts. """
         d = {}
         for k, v in self.items():
+            if v is Missing:
+                print('WHAT?' + k)
+                exit(1)
             if isinstance(v, Model) or isinstance(v, ListModel):
                 v = v.primitive()
             d[k] = v

@@ -15,6 +15,7 @@ import platform
 import sys
 import urllib
 
+from typing import Dict, Callable
 from fcntl import fcntl, F_GETFL, F_SETFL
 from os import O_NONBLOCK, read
 
@@ -35,7 +36,7 @@ class RetryException(Exception):
     pass
 
 
-def retry(retries, task_f, check_f=bool, wait_f=None):
+def retry(retries: int, task_f: Callable, check_f: Callable = bool, wait_f: Callable = None):
     """
     Try a function up to n times.
     Raise an exception if it does not pass in time
@@ -67,7 +68,7 @@ def urlopen_assert(url_or_req, httpcode=200, retries=3):
                  wait_f=lambda x: time.sleep(30))
 
 
-def cmd_assert(cmd, retries=1, pollrate=60, on_retry=None, set_env=None, strip=False):
+def cmd_assert(cmd, retries: int = 1, pollrate: int = 60, on_retry: Callable = None, set_env: Dict = None, strip: bool = False):
     """
     Run a command, logging (using exec_cmd) and raise an exception if the
     return code of the command indicates failure.

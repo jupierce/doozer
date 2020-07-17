@@ -5,6 +5,7 @@ from future.utils import as_native_str
 from multiprocessing.dummy import Pool as ThreadPool
 from contextlib import contextmanager
 from collections import namedtuple
+from typing import List, Dict, Tuple
 
 import os
 import sys
@@ -36,6 +37,7 @@ from .pushd import Dir
 
 from .image import ImageMetadata
 from .rpmcfg import RPMMetadata
+from .metadata import Metadata
 from doozerlib import state
 from .model import Model, Missing
 from multiprocessing import Lock, RLock
@@ -111,12 +113,6 @@ def _unpack_tuple_args(func):
     return wrapper
 
 
-# A named tuple for caching the result of Runtime._resolve_source.
-SourceResolution = namedtuple('SourceResolution', [
-    'source_path', 'url', 'branch', 'public_upstream_url', 'public_upstream_branch'
-])
-
-
 # ============================================================================
 # Runtime object definition
 # ============================================================================
@@ -125,6 +121,9 @@ SourceResolution = namedtuple('SourceResolution', [
 class Runtime(object):
     # Use any time it is necessary to synchronize feedback from multiple threads.
     mutex = RLock()
+
+    # Protect access to the resolved_source_paths path dict
+    _source_path_lock = RLock()
 
     # Serialize access to the shared koji session
     koji_lock = RLock()
@@ -179,21 +178,21 @@ class Runtime(object):
         self.flags_dir = None
 
         # Map of dist-git repo name -> ImageMetadata object. Populated when group is set.
-        self.image_map = {}
+        self.image_map: Dict[str, ImageMetadata] = {}
 
         # Map of dist-git repo name -> RPMMetadata object. Populated when group is set.
         self.rpm_map = {}
 
-        # Map of source code repo aliases (e.g. "ose") to a tuple representing the source resolution cache.
-        # See registry_repo.
-        self.source_resolutions = {}
+        # Map of source code repo keys to a local path where that source code is available.
+        # The keys can be a distgit_key, a source alias, or a unique key generated for each metadata.
+        self._resolved_source_paths: Dict[str, str] = {}
 
         # Map of source code repo aliases (e.g. "ose") to a (public_upstream_url, public_upstream_branch) tuple.
         # See registry_repo.
-        self.public_upstreams = {}
+        self.public_upstreams: Dict[str, str] = {}
 
         # Map of stream alias to image name.
-        self.stream_alias_overrides = {}
+        self.stream_alias_overrides: Dict[str, str] = {}
 
         self.initialized = False
 
@@ -350,7 +349,7 @@ class Runtime(object):
         # For each "--source alias path" on the command line, register its existence with
         # the runtime.
         for r in self.source:
-            self.register_source_alias(r[0], r[1])
+            self.register_source_local_path(r[0], r[1])
 
         if self.sources:
             with io.open(self.sources, 'r', encoding='utf-8') as sf:
@@ -358,7 +357,7 @@ class Runtime(object):
                 if not isinstance(source_dict, dict):
                     raise ValueError('--sources param must be a yaml file containing a single dict.')
                 for key, val in source_dict.items():
-                    self.register_source_alias(key, val)
+                    self.register_source_local_path(key, val)
 
         with Dir(self.group_dir):
 
@@ -649,7 +648,7 @@ class Runtime(object):
         if self.freeze_automation == FREEZE_AUTOMATION_YES:
             raise DoozerFatalError('Automation (builds / mutations) for this group is currently frozen (freeze_automation set to {}). Coordinate with the group owner to change this if you believe it is incorrect.'.format(FREEZE_AUTOMATION_YES))
 
-    def image_metas(self):
+    def image_metas(self) -> List[ImageMetadata]:
         return list(self.image_map.values())
 
     def ordered_image_metas(self):
@@ -713,55 +712,42 @@ class Runtime(object):
     def all_metas(self):
         return self.image_metas() + self.rpm_metas()
 
-    def register_source_alias(self, alias, path):
-        self.logger.info("Registering source alias %s: %s" % (alias, path))
-        path = os.path.abspath(path)
-        assertion.isdir(path, "Error registering source alias %s" % alias)
-        with Dir(path):
-            url = None
-            origin_url = "?"
-            rc1, out_origin, err_origin = exectools.cmd_gather(
-                ["git", "config", "--get", "remote.origin.url"])
-            if rc1 == 0:
-                url = out_origin.strip()
-                origin_url = url
-                # Usually something like "git@github.com:openshift/origin.git"
-                # But we want an https hyperlink like http://github.com/openshift/origin
-                if origin_url.startswith("git@"):
-                    origin_url = origin_url[4:]  # remove git@
-                    origin_url = origin_url.replace(":", "/", 1)  # replace first colon with /
+    def lookup_source_local_path(self, repo_key):
+        with self._source_path_lock:
+            return self._resolved_source_paths.get(repo_key, None)
 
-                    if origin_url.endswith(".git"):
-                        origin_url = origin_url[:-4]  # remove .git
+    def register_source_local_path(self, repo_key, path):
+        with self._source_path_lock:
+            self.logger.info("Registering source alias %s: %s" % (repo_key, path))
+            path = os.path.abspath(path)
+            assertion.isdir(path, "Error registering source alias %s" % repo_key)
+            with Dir(path):
+                url = None
+                origin_url = "?"
+                rc1, out_origin, err_origin = exectools.cmd_gather(
+                    ["git", "config", "--get", "remote.origin.url"])
+                if rc1 == 0:
+                    url = out_origin.strip()
+                    # Usually something like "git@github.com:openshift/origin.git"
+                    # But we want an https hyperlink like http://github.com/openshift/origin
+                    origin_url = util.convert_remote_git_to_https(url)
+                else:
+                    self.logger.error("Failed acquiring origin url for source %s: %s" % (repo_key, err_origin))
 
-                    origin_url = "https://%s" % origin_url
-            else:
-                self.logger.error("Failed acquiring origin url for source alias %s: %s" % (alias, err_origin))
+                branch = None
+                rc2, out_branch, err_branch = exectools.cmd_gather(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"])
+                if rc2 == 0:
+                    branch = out_branch.strip()
+                else:
+                    self.logger.error("Failed acquiring origin branch for source %s: %s" % (repo_key, err_branch))
 
-            branch = None
-            rc2, out_branch, err_branch = exectools.cmd_gather(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"])
-            if rc2 == 0:
-                branch = out_branch.strip()
-            else:
-                self.logger.error("Failed acquiring origin branch for source alias %s: %s" % (alias, err_branch))
+                if self.group_config.public_upstreams:
+                    if not (url and branch):
+                        raise DoozerFatalError(f"Couldn't detect source URL or branch for local source {path}. Is it a valid Git repo?")
 
-            if self.group_config.public_upstreams:
-                if not (url and branch):
-                    raise DoozerFatalError(f"Couldn't detect source URL or branch for local source {path}. Is it a valid Git repo?")
-                public_upstream_url, public_upstream_branch = self.get_public_upstream(url)
-                self.source_resolutions[alias] = SourceResolution(path, url, branch, public_upstream_url, public_upstream_branch or branch)
-            else:
-                self.source_resolutions[alias] = SourceResolution(path, url, None, None)
-
-            if 'source_alias' not in self.state:
-                self.state['source_alias'] = {}
-            self.state['source_alias'][alias] = {
-                'url': origin_url,
-                'branch': branch or '?',
-                'path': path
-            }
-            self.add_record("source_alias", alias=alias, origin_url=origin_url, branch=branch or '?', path=path)
+                self._resolved_source_paths[repo_key] = path
+                self.add_record("source_alias", alias=repo_key, origin_url=origin_url, branch=branch or '?', path=path)
 
     def register_stream_alias(self, alias, image):
         self.logger.info("Registering image stream alias override %s: %s" % (alias, image))
@@ -935,9 +921,17 @@ class Runtime(object):
 
         return (remote_https, None)
 
-    def git_clone(self, remote_url, target_dir, gitargs=None, set_env=None, timeout=0):
+    def git_clone(self, remote_url: str, target_dir: str, gitargs: List = None, set_env: Dict = None, timeout: int = 0):
+        """
+        :param remote_url: The git repo to clone
+        :param target_dir: The directory that should contain the repo content
+        :param gitargs: A list of arguments to pass on the git clone invocation
+        :param set_env: A dictionary of environment variables to provide to the git clone invocations
+        :param timeout: A timeout for the clone operation
+        :return:
+        """
         gitargs = gitargs or []
-        set_env = set_env or []
+        set_env = set_env or {}
 
         if self.cache_dir:
             git_cache_dir = os.path.join(self.cache_dir, self.user or "default", 'git')
@@ -988,7 +982,7 @@ class Runtime(object):
         cmd.append(target_dir)
         exectools.cmd_assert(cmd, retries=3, on_retry=["rm", "-rf", target_dir], set_env=set_env)
 
-    def resolve_source(self, meta):
+    def resolve_source(self, meta: Metadata) -> str:
         """
         Looks up a source alias and returns a path to the directory containing
         that source. Sources can be specified on the command line, or, failing
@@ -999,176 +993,97 @@ class Runtime(object):
         :param meta: The MetaData object to resolve source for
         :return: Returns the source path or None if upstream source is not defined
         """
+        dgk = meta.distgit_key
         source = meta.config.content.source
+        logger = meta.logger
 
         if not source:
             return None
 
-        parent = f'{meta.namespace}_{meta.name}'
+        # Acquire where the metadata thinks its upstream is. Upstream & any public
+        # upstream are included in this object. This will usually be where we
+        # clone the source from, but that may be overridden with --source/--sources
+        # on the command line if the metadata yaml refers to an alias.
+        source_details = meta.get_source_details()
 
-        # This allows passing `--source <distgit_key> path` to
-        # override any source to something local without it
-        # having been configured for an alias
-        if self.local and meta.distgit_key in self.source_resolutions:
-            source['alias'] = meta.distgit_key
-            if 'git' in source:
-                del source['git']
+        logger.debug("Resolving local source directory")
 
-        source_details = None
-        if 'git' in source:
-            git_url = urllib.parse.urlparse(source.git.url)
-            name = os.path.splitext(os.path.basename(git_url.path))[0]
-            alias = '{}_{}'.format(parent, name)
-            source_details = dict(source.git)
-        elif 'alias' in source:
-            alias = source.alias
+        cmdline_path = self.lookup_source_local_path(meta.distgit_key)
+        if cmdline_path:
+            # The distgit source repo was specified on the command line. No need to do more.
+            logger.debug("Returning command line provided path: {}".format(cmdline_path))
+            return cmdline_path
+
+        if 'git' in source:  # The metadata points to a real git location
+            # construct a pseudo alias for this source checkout
+            repo_org, repo_name = source_details.get_source_repo_components()
+            repo_key = f'{meta.namespace}_{meta.name}_{repo_org}_{repo_name}_{source_details.get_source_git_branch()}'
+            sub_path = repo_key
+        elif 'alias' in source:  # The metadata is pointing to a group alias
+            repo_key = source.alias
+            sub_path = f'global_{repo_key}'
         else:
-            return None
+            raise IOError('Invalid source block in {}'.format(dgk))
 
-        self.logger.debug("Resolving local source directory for alias {}".format(alias))
-        if alias in self.source_resolutions:
-            path, _, _, meta.public_upstream_url, meta.public_upstream_branch = self.source_resolutions[alias]
-            self.logger.debug("returning previously resolved path for alias {}: {}".format(alias, path))
-            return path
+        previously_resolved_path = self.lookup_source_local_path(repo_key)
+        if previously_resolved_path:
+            # This path has either already been resolved by this method OR was specified directly on the command
+            # line with --source / --sources as an alias
+            logger.debug("returning resolved path for {}: {}".format(repo_key, previously_resolved_path))
+            return previously_resolved_path
 
-        # Where the source will land, check early so we know if old or new style
-        sub_path = '{}{}'.format('global_' if source_details is None else '', alias)
-        source_dir = os.path.join(self.sources_dir, sub_path)
+        # At this point, the metadata:
+        # - Does not have source from a alias or distgit_key that was specified on the command line
+        # - Has not already been resolved by resolve_source before
 
-        if not source_details:  # old style alias was given
-            if self.group_config.sources is Missing or alias not in self.group_config.sources:
-                raise DoozerFatalError("Source alias not found in specified sources or in the current group: %s" % alias)
-            source_details = self.group_config.sources[alias]
+        with self.get_named_lock(sub_path):
 
-        self.logger.debug("checking for source directory in source_dir: {}".format(source_dir))
+            dest_source_dir: str = os.path.join(self.sources_dir, sub_path)  # Where are we going to put it?
 
-        with self.get_named_lock(source_dir):
-            if alias in self.source_resolutions:  # we checked before, but check again inside the lock
-                path, _, _, meta.public_upstream_url, meta.public_upstream_branch = self.source_resolutions[alias]
-                self.logger.debug("returning previously resolved path for alias {}: {}".format(alias, path))
-                return path
-
-            # If this source has already been extracted for this working directory
-            if os.path.isdir(source_dir):
+            # If this source has already been extracted for this working directory (e.g. by a previous doozer run)
+            if os.path.isdir(dest_source_dir):
                 # Store so that the next attempt to resolve the source hits the map
-                self.register_source_alias(alias, source_dir)
-                if self.group_config.public_upstreams:
-                    _, _, _, meta.public_upstream_url, meta.public_upstream_branch = self.source_resolutions[alias]
-                self.logger.info("Source '{}' already exists in (skipping clone): {}".format(alias, source_dir))
-                return source_dir
+                self.register_source_local_path(repo_key, dest_source_dir)
+                logger.info("Source '{}' already exists in (skipping clone): {}".format(repo_key, dest_source_dir))
+                return dest_source_dir
 
-            url = source_details["url"]
-            clone_branch, _ = self.detect_remote_source_branch(source_details)
-            if self.group_config.public_upstreams:
-                meta.public_upstream_url, meta.public_upstream_branch = self.get_public_upstream(url)
-                if not meta.public_upstream_branch:  # default to the same branch name as private upstream
-                    meta.public_upstream_branch = clone_branch
+            url = source_details.get_source_git_url()
+            clone_branch = source_details.get_source_git_branch()
 
-            self.logger.info("Attempting to checkout source '%s' branch %s in: %s" % (url, clone_branch, source_dir))
             try:
-                self.logger.info("Attempting to checkout source '%s' branch %s in: %s" % (url, clone_branch, source_dir))
+                logger.info("Attempting to checkout source '%s' branch %s in: %s" % (url, clone_branch, dest_source_dir))
                 # clone all branches as we must sometimes reference master /OWNERS for maintainer information
                 gitargs = [
                     '--no-single-branch', '--branch', clone_branch
                 ]
-                if not self.group_config.public_upstreams:
-                    # Do a shallow clone only if public upstreams are not specified
+
+                if not meta.commitish and not self.group_config.public_upstreams:
+                    # If we are trying to build from a commitish, make sure we don't shallow clone.
+                    # Also, if there are public upstreams, avoid shallow clone because we will need to
+                    # compare commits between public & private to determine if there is a CVE commit.
                     gitargs.extend(['--depth', '1'])
-                self.git_clone(url, source_dir, gitargs=gitargs, set_env=constants.GIT_NO_PROMPTS)
-                if meta.commitish:
-                    # Commit-ish may not be in the history because of shallow clone. Fetch from upstream if not existing.
-                    self.logger.info(f"Determining if commit-ish {meta.commitish} exists")
-                    cmd = ["git", "-C", source_dir, "branch", "--contains", meta.commitish]
-                    rc, _, _ = exectools.cmd_gather(cmd)
-                    if rc != 0:  # commit-ish does not exist
-                        self.logger.info(f"Fetching commit-ish {meta.commitish} from upstream")
-                        cmd = ["git", "-C", source_dir, "fetch", "origin", "--depth", "1", meta.commitish]
-                        exectools.cmd_assert(cmd)
+
+                self.git_clone(url, dest_source_dir, gitargs=gitargs, set_env=constants.GIT_NO_PROMPTS)
+
                 # fetch public upstream source
-                if meta.public_upstream_branch:
-                    util.setup_and_fetch_public_upstream_source(meta.public_upstream_url, meta.public_upstream_branch, source_dir)
+                if source_details.has_private_upstream():
+                    # If this metadata has public upstream that does not match its true source, checkout the public
+                    util.setup_and_fetch_public_upstream_source(source_details.get_public_git_url(), source_details.get_public_git_branch(), dest_source_dir)
 
             except IOError as e:
-                self.logger.info("Unable to checkout branch {}: {}".format(clone_branch, str(e)))
-                shutil.rmtree(source_dir)
-                raise DoozerFatalError("Error checking out target branch of source '%s' in: %s" % (alias, source_dir))
+                logger.info("Unable to checkout branch {}: {}".format(clone_branch, str(e)))
+                shutil.rmtree(dest_source_dir)
+                raise DoozerFatalError("Error checking out target branch of source '%s' in: %s" % (repo_key, dest_source_dir))
 
             # Store so that the next attempt to resolve the source hits the map
-            self.register_source_alias(alias, source_dir)
-            return source_dir
-
-    def detect_remote_source_branch(self, source_details):
-        """Find a configured source branch that exists, or raise DoozerFatalError. Returns branch name and git hash"""
-        git_url = source_details["url"]
-        branches = source_details["branch"]
-
-        branch = branches["target"]
-        fallback_branch = branches.get("fallback", None)
-        if self.group_config.use_source_fallback_branch == "always" and fallback_branch:
-            # only use the fallback (unless none is given)
-            branch, fallback_branch = fallback_branch, None
-        elif self.group_config.use_source_fallback_branch == "never":
-            # ignore the fallback
-            fallback_branch = None
-        stage_branch = branches.get("stage", None) if self.stage else None
-
-        if stage_branch:
-            self.logger.info('Normal branch overridden by --stage option, using "{}"'.format(stage_branch))
-            result = self._get_remote_branch_ref(git_url, stage_branch)
-            if result:
-                return stage_branch, result
-            raise DoozerFatalError('--stage option specified and no stage branch named "{}" exists for {}'.format(stage_branch, git_url))
-
-        result = self._get_remote_branch_ref(git_url, branch)
-        if result:
-            return branch, result
-        elif not fallback_branch:
-            raise DoozerFatalError('Requested target branch {} does not exist and no fallback provided'.format(branch))
-
-        self.logger.info('Target branch does not exist in {}, checking fallback branch {}'.format(git_url, fallback_branch))
-        result = self._get_remote_branch_ref(git_url, fallback_branch)
-        if result:
-            return fallback_branch, result
-        raise DoozerFatalError('Requested fallback branch {} does not exist'.format(branch))
-
-    def _get_remote_branch_ref(self, git_url, branch):
-        """Detect whether a single branch exists on a remote repo; returns git hash if found"""
-        self.logger.info('Checking if target branch {} exists in {}'.format(branch, git_url))
-        try:
-            out, _ = exectools.cmd_assert('git ls-remote --heads {} {}'.format(git_url, branch), retries=3)
-        except Exception as err:
-            self.logger.error('Unable to check if target branch {} exists: {}'.format(branch, err))
-            return None
-        result = out.strip()  # any result means the branch is found
-        return result.split()[0] if result else None
-
-    def resolve_source_head(self, meta):
-        """
-        Attempts to resolve the branch a given source alias has checked out. If not on a branch
-        returns SHA of head.
-        :param meta: The MetaData object to resolve source for
-        :return: The name of the checked out branch or None (if required=False)
-        """
-        source_dir = self.resolve_source(meta)
-
-        if not source_dir:
-            return None
-
-        with io.open(os.path.join(source_dir, '.git/HEAD'), encoding="utf-8") as f:
-            head_content = f.read().strip()
-            # This will either be:
-            # a SHA like: "52edbcd8945af0dc728ad20f53dcd78c7478e8c2"
-            # a local branch name like: "ref: refs/heads/master"
-            if head_content.startswith("ref:"):
-                return head_content.split('/', 2)[2]  # limit split in case branch name contains /
-
-            # Otherwise, just return SHA
-            return head_content
+            self.register_source_local_path(repo_key, dest_source_dir)
+            return dest_source_dir
 
     def export_sources(self, output):
-        self.logger.info('Writing sources to {}'.format(output))
-        with io.open(output, 'w', encoding='utf-8') as sources_file:
-            yaml.dump({k: v.path for k, v in self.source_resolutions.items()}, sources_file, default_flow_style=False)
+        with self._source_path_lock:
+            self.logger.info('Writing sources to {}'.format(output))
+            with io.open(output, 'w', encoding='utf-8') as sources_file:
+                yaml.dump({k: v.path for k, v in self._resolved_source_paths.items()}, sources_file, default_flow_style=False)
 
     def auto_version(self, repo_type):
         """

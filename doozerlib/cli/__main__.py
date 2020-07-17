@@ -12,6 +12,7 @@ from doozerlib import metadata
 from doozerlib.config import MetaDataConfig as mdc
 from doozerlib.cli import cli, pass_runtime, CTX_GLOBAL
 from doozerlib.cli.release_gen_payload import release_gen_payload
+from doozerlib.cli.reconcile_upstream import reconcile_upstream
 
 from doozerlib.exceptions import DoozerFatalError
 from doozerlib import exectools
@@ -776,24 +777,31 @@ def images_rebase(runtime, stream, version, release, embargoed, repo_type, messa
 
     def dgr_rebase(image_meta):
         try:
-            dgr = image_meta.distgit_repo()
-            if embargoed:
-                dgr.private_fix = True
-            (real_version, real_release) = dgr.rebase_dir(version, release)
-            sha = dgr.commit(message, log_diff=True)
-            dgr.tag(real_version, real_release)
-            runtime.add_record(
-                "distgit_commit",
-                distgit=image_meta.qualified_name,
-                image=image_meta.config.name,
-                sha=sha,
-            )
-            state.record_image_success(lstate, image_meta)
+            with runtime.db.record('rebase', image_meta) as dbr:
+                try:
+                    dgr = image_meta.distgit_repo()
+                    if embargoed:
+                        dgr.private_fix = True
+                    (real_version, real_release) = dgr.rebase_dir(version, release)
+                    sha = dgr.commit(message, log_diff=True)
+                    dgr.tag(real_version, real_release)
+                    dbr.set('dg.sha', sha)
+                    runtime.add_record(
+                        "distgit_commit",
+                        distgit=image_meta.qualified_name,
+                        image=image_meta.config.name,
+                        sha=sha,
+                    )
+                    state.record_image_success(lstate, image_meta)
 
-            if push:
-                (meta, success) = dgr.push()
-                if success is not True:
-                    state.record_image_fail(lstate, meta, success)
+                    dbr.set('state', 'success')
+                    if push:
+                        (meta, success) = dgr.push()
+                        if success is not True:
+                            state.record_image_fail(lstate, meta, success)
+                except Exception:
+                    dbr.set('state', 'failure')
+                    raise
 
         except Exception as ex:
             # Only the message will recorded in the state. Make sure we print out a stacktrace in the logs.
